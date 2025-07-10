@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import enum
+
+import copy
 import functools
 import json
 import re
@@ -19,11 +20,16 @@ import time
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import Any, Generator, Optional, Union
+from typing import Generator, Optional
 
 from huggingface_hub import ModelInfo, model_info
 
-from transformers.utils.import_utils import is_fastapi_available, is_pydantic_available, is_uvicorn_available
+from transformers.utils.import_utils import (
+    is_fastapi_available,
+    is_openai_available,
+    is_pydantic_available,
+    is_uvicorn_available,
+)
 
 from .. import LogitsProcessorList, PreTrainedTokenizerFast, TextIteratorStreamer
 from ..generation.continuous_batching import ContinuousBatchingManager, RequestStatus
@@ -42,184 +48,98 @@ if is_torch_available():
         PreTrainedModel,
     )
 
-if is_pydantic_available() and is_fastapi_available() and is_uvicorn_available():
+if is_pydantic_available() and is_fastapi_available() and is_uvicorn_available() and is_openai_available():
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, StreamingResponse
-    from pydantic import BaseModel
+    from openai.types.chat.chat_completion_chunk import (
+        ChatCompletionChunk,
+        Choice,
+        ChoiceDelta,
+        ChoiceDeltaToolCall,
+        ChoiceDeltaToolCallFunction,
+    )
+    from openai.types.chat.completion_create_params import CompletionCreateParamsStreaming
+    from openai.types.responses import (
+        Response,
+        ResponseCompletedEvent,
+        ResponseContentPartAddedEvent,
+        ResponseContentPartDoneEvent,
+        ResponseCreatedEvent,
+        ResponseInProgressEvent,
+        ResponseOutputItemAddedEvent,
+        ResponseOutputItemDoneEvent,
+        ResponseOutputMessage,
+        ResponseOutputText,
+        ResponseTextDeltaEvent,
+        ResponseTextDoneEvent,
+    )
+    from openai.types.responses.response_create_params import ResponseCreateParamsStreaming
+    from pydantic import BaseModel, TypeAdapter, ValidationError
+    from typing_extensions import _TypedDictMeta
 
-    class Message(BaseModel):
-        role: str
-        content: str
+    # Expand OpenAI's request input types with an optional `generation_config` field
+    class TransformersResponseCreateParamsStreaming(ResponseCreateParamsStreaming, total=False):
+        """
+        OpenAI's ResponseCreateParamsStreaming with an additional field for the generation config (as a json string).
+        """
 
-    class Prompt(BaseModel):
-        id: str
-        variables: dict
-        version: Optional[str]
+        generation_config: Optional[str]
 
-    class TextFormatOptions(enum.StrEnum):
-        text = "text"
-        json_schema = "json_schema"
+    class TransformersCompletionCreateParamsStreaming(CompletionCreateParamsStreaming, total=False):
+        """
+        OpenAI's CompletionCreateParamsStreaming with an additional field for the generation config (as a json string).
+        """
 
-    class TextFormat(BaseModel):
-        type: TextFormatOptions
+        generation_config: Optional[str]
 
-    class ResponsesInput(BaseModel):
-        input: str | list
-        model: str
+    # Contrarily to OpenAI's output types, input types are `TypedDict`, which don't have validation
+    response_validator = TypeAdapter(TransformersResponseCreateParamsStreaming)
+    completion_validator = TypeAdapter(TransformersCompletionCreateParamsStreaming)
 
-        stream: Optional[bool] = False
-        instructions: Optional[str] = None
-        max_output_tokens: Optional[int] = None
-        max_tool_calls: Optional[int] = None
-        previous_response_id: Optional[str] = None
-        prompt: Optional[Prompt] = None
-        temperature: Optional[float] = None
-        text: Optional[TextFormat] = None
-        tools: Any = None
-        top_p: Optional[float] = None
-        metadata: Optional[dict[str, Any]] = None
-
-        # Additional options supported by the Responses API
-        # that aren't yet supported here.
-        # top_logprobs
-
-    class ResponsesOutputContent(BaseModel):
-        type: str
-        text: str
-        annotations: Optional[list[str]] = []
-
-    # Desperately need a better name than this
-    class ResponsesOutputOutput(BaseModel):
-        type: str
-        id: str
-        status: str
-        role: str
-        content: list[ResponsesOutputContent]
-
-    class ResponseOutputItem(BaseModel):
-        type: str
-        id: str
-        status: str
-        role: str
-        content: Optional[list[str | ResponsesOutputContent]] = []
-
-    ### For `response.created`, `response.in_progress`, and `response.completed`
-    class ResponsesOutput(BaseModel):
-        id: str
-        object: Optional[str] = "response"
-        created_at: int
-        status: str
-        error: Optional[str] = None
-        incomplete_details: Optional[str] = None
-        instructions: Optional[str] = None
-        max_output_tokens: Optional[int] = None
-        model: str
-        output: Optional[list[ResponsesOutputOutput]] = []
-        parallel_tool_calls: Optional[bool] = False
-        previous_response_id: Optional[str] = None
-        temperature: Optional[float] = None
-        text: Optional[Any] = None
-        tool_choice: Optional[str] = None
-        tools: Optional[list[str]] = None
-        top_p: Optional[float] = None
-        metadata: Optional[dict[str, Any]] = None
-
-    class Response(BaseModel):
-        type: str
-        response: Optional[ResponsesOutput] = None
-        output_index: Optional[int] = None
-
-    ###
-
-    #### For `response.output_item.added`
-    class ResponseOutputItemAdded(BaseModel):
-        type: str
-        output_index: int
-        item: ResponseOutputItem
-
-    ###
-
-    ### For `response.content_part.added`
-    class ResponseContentPartAdded(BaseModel):
-        type: str
-        item_id: str
-        output_index: int
-        content_index: int
-        part: ResponsesOutputContent
-
-    ###
-
-    ### For `response.output_text.delta`
-    class ResponseOutputTextDelta(BaseModel):
-        type: str
-        item_id: str
-        output_index: int
-        content_index: int
-        delta: str
-
-    ###
-
-    ### For `response.output_text.done`
-    class ResponseOutputTextDone(BaseModel):
-        type: str
-        item_id: str
-        output_index: int
-        content_index: int
-        text: str
-
-    ###
-
-    ### For `response.content_part.done`
-    class ResponseContentPartDone(BaseModel):
-        type: str
-        item_id: str
-        output_index: int
-        content_index: int
-        part: ResponsesOutputContent
-
-    ###
-
-    #### For `response.output_item.done`
-    class ResponseOutputItemDone(BaseModel):
-        type: str
-        output_index: int
-        item: ResponseOutputItem
-
-    ###
-
-    ### Chat Completion
-    class ChatCompletionInput(BaseModel):
-        messages: list[Message]
-        model: str
-
-        stream: Optional[bool] = False
-        request_id: Optional[str] = None
-        extra_body: Optional[dict] = None
-        frequency_penalty: Optional[float] = None
-        logit_bias: Optional[list[float]] = None
-        max_tokens: Optional[int] = None
-        stop: Optional[list[str]] = None
-        temperature: Optional[float] = None
-        top_p: Optional[float] = None
-        seed: Optional[int] = None
-
-        # Additional options supported by the HFH InferenceClient
-        # that aren't yet supported here.
-
-        # logprobs: Optional[bool] = None
-        tools: Any = None
-        # n: Optional[int] = None
-        # presence_penalty: Optional[float] = None
-        # response_format: Optional[ChatCompletionInputGrammarType] = None
-        # stream_options: Optional[ChatCompletionInputStreamOptions] = None
-        # tool_choice: Optional[Union[ChatCompletionInputToolChoiceClass, "ChatCompletionInputToolChoiceEnum"]] = None
-        # tool_prompt: Optional[str] = None
-        # top_logprobs: Optional[int] = None
-
-        # transformers-specific request fields
-        generation_config: Optional[str] = None
+    # Define request fields that are not yet used in `transformers serve`. Receiving these fields will raise an
+    # HTTPException.
+    UNUSED_RESPONSE_FIELDS = {
+        "background",
+        "include",
+        "max_tool_calls",
+        "metadata",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "prompt",
+        "reasoning",
+        "service_tier",
+        "store",
+        "text",
+        "tool_choice",
+        "top_logprobs",
+        "truncation",
+        "user",
+    }
+    UNUSED_COMPLETION_FIELDS = {
+        "audio",
+        "function_call",
+        "functions",
+        "logprobs",
+        "max_completion_tokens",
+        "metadata",
+        "modalities",
+        "n",
+        "parallel_tool_calls",
+        "prediction",
+        "presence_penalty",
+        "reasoning_effort",
+        "response_format",
+        "service_tier",
+        "stop",
+        "store",
+        "stream_options",
+        "tool_choice",
+        "top_logprobs",
+        "user",
+        "web_search_options",
+    }
 
 
 logger = logging.get_logger(__name__)
@@ -245,7 +165,9 @@ def serve_command_factory(args: Namespace):
 
 
 def create_generation_config_from_req(
-    req: Union["ChatCompletionInput", "ResponsesInput"], **kwargs
+    req: dict,
+    model_generation_config: "GenerationConfig",
+    **kwargs,
 ) -> "GenerationConfig":
     """
     Creates a generation config from the parameters of the request. If a generation config is passed in the request,
@@ -253,21 +175,20 @@ def create_generation_config_from_req(
     Other parameters in the request will be applied on top of the baseline.
 
     Args:
-        req (`ChatCompletionInput`):
+        req (`dict`):
             The request which may optionally contain generation parameters.
         model_generation_config (`GenerationConfig`):
             The model's default generation config.
+        kwargs (`dict`):
+            Additional parameters to set in the generation config.
 
     Returns:
         The prepared `GenerationConfig` object.
     """
-    if req.metadata is not None and "generation_config" in req.metadata:
-        for key in req.metadata["generation_config"].keys():
-            if key in ChatCompletionInput.base_field_names.keys():
-                raise ValueError("error: Duplicated key in the root request and in the passed generation config.")
-
-    if req.metadata is not None and "generation_config" in req.metadata:
-        generation_config = GenerationConfig(**(req.metadata["generation_config"]), **kwargs)
+    # If there is a generation config in the request, it is a json string serialization from a `GenerationConfig`
+    # object. For simplicity, flags set here take precedence over all other flags.
+    if req.get("generation_config") is not None:
+        generation_config = GenerationConfig(**json.loads(req["generation_config"]))
     else:
         generation_config = copy.deepcopy(model_generation_config)
 
@@ -277,23 +198,21 @@ def create_generation_config_from_req(
         if v is not None:
             setattr(generation_config, k, v)
 
-    if isinstance(req, ResponsesInput):
-        return generation_config
-
-    if req.frequency_penalty is not None:
-        generation_config.repetition_penalty = float(req.frequency_penalty)
-    if req.logit_bias is not None:
-        generation_config.sequence_bias = req.logit_bias
-    if req.stop is not None:
-        generation_config.stop_strings = req.stop
-    if req.temperature is not None:
-        generation_config.temperature = float(req.temperature)
-        if float(req.temperature) == 0.0:
+    # Completion-specific parameters
+    if req.get("frequency_penalty") is not None:
+        generation_config.repetition_penalty = float(req["frequency_penalty"])
+    if req.get("logit_bias") is not None:
+        generation_config.sequence_bias = req["logit_bias"]
+    if req.get("stop") is not None:
+        generation_config.stop_strings = req["stop"]
+    if req.get("temperature") is not None:
+        generation_config.temperature = float(req["temperature"])
+        if float(req["temperature"]) == 0.0:
             generation_config.do_sample = False
-    if req.top_p is not None:
-        generation_config.top_p = float(req.top_p)
-    if req.seed is not None:
-        torch.manual_seed(req.seed)
+    if req.get("top_p") is not None:
+        generation_config.top_p = float(req["top_p"])
+    if req.get("seed") is not None:
+        torch.manual_seed(req["seed"])
 
     return generation_config
 
@@ -410,19 +329,56 @@ class ServeCommand(BaseTransformersCLICommand):
         cb_logger = logging.get_logger("transformers.generation.continuous_batching")
         cb_logger.setLevel(logging.log_levels[self.args.log_level.lower()])
 
+    def validate_request(self, request: dict, schema: "_TypedDictMeta", validator: TypeAdapter, unused_fields: set):
+        """
+        Validates the request against the schema, and checks for unexpected keys.
+
+        Args:
+            request (`dict`):
+                The request to validate.
+            schema (`_TypedDictMeta`):
+                The schema of the request to validate. It is a `TypedDict` definition.
+            validator (`TypeAdapter`):
+                The validator to use to validate the request. Built from `schema`.
+            unused_fields (`set`):
+                Fields accepted by `schema`, but not used in `transformers serve`.
+
+        Raises:
+            HTTPException: If the request is invalid or contains unexpected or unused fields.
+        """
+        logger.debug(f"Validating request: {request}")
+
+        # Validate expected keys
+        try:
+            validator.validate_python(request)
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=e.errors())
+
+        # Validate unexpected keys -- Pydantic doesn't validate extra keys in the request.
+        input_keys = set(request.keys())
+        possible_keys = schema.__mutable_keys__
+        unexpected_keys = input_keys - possible_keys
+        if unexpected_keys:
+            raise HTTPException(status_code=422, detail=f"Unexpected keys in the request: {unexpected_keys}")
+
+        # Validate unused fields
+        unused_fields_in_request = input_keys & unused_fields
+        if unused_fields_in_request:
+            raise HTTPException(status_code=422, detail=f"Unused fields in the request: {unused_fields_in_request}")
+
     def build_chat_completions_chunk(
         self,
         request_id: Optional[str] = "",
         content: Optional[str] = None,
         role: Optional[str] = None,
         finish_reason: Optional[str] = None,
-        tool_calls: Optional[list[dict]] = None,
+        tool_calls: Optional[list[ChoiceDeltaToolCall]] = None,
     ) -> str:
         """
-        Builds a chunk of a streaming response.
+        Builds a chunk of a streaming chat completion response.
 
-        IMPORTANT: The built chunk won't contain empty fields (fields with `None`). Some downstream apps, like Cursor,
-        assume that when the field exists, it has data.
+        IMPORTANT: The serialized chunk won't contain empty fields (fields with `None`). Some downstream apps,
+        like Cursor, assume that when the field exists, it has data.
 
         Args:
             request_id (`str`):
@@ -433,33 +389,34 @@ class ServeCommand(BaseTransformersCLICommand):
                 The role of the next content, until a new role is defined.
             finish_reason (`str`, *optional*):
                 The reason the generation by the model has finished.
-            tool_calls (`list[dict]`, *optional*):
+            tool_calls (`list[ChoiceDeltaToolCall]`, *optional*):
                 Data about the tool calls, when they are triggered.
 
         Returns:
             `str`: The built chunk, a string containing a JSON string with the payload.
         """
-        payload = {
-            "object": "chat.completion.chunk",
-            "id": request_id,
-            "created": int(time.time()),
-            "model": self.loaded_model,
-            "choices": [{"delta": {}, "index": 0}],
-            "system_fingerprint": "",
-        }
-        if content is not None:
-            payload["choices"][0]["delta"]["content"] = content
-        if role is not None:
-            payload["choices"][0]["delta"]["role"] = role
-        if tool_calls is not None:
-            payload["choices"][0]["delta"]["tool_calls"] = tool_calls
-        if finish_reason is not None:
-            payload["choices"][0]["finish_reason"] = finish_reason
+        chunk = ChatCompletionChunk(
+            id=request_id,
+            created=int(time.time()),
+            model=self.loaded_model,
+            choices=[
+                Choice(
+                    delta=ChoiceDelta(
+                        content=content,
+                        role=role,
+                        tool_calls=tool_calls,
+                    ),
+                    index=0,
+                    finish_reason=finish_reason,
+                )
+            ],
+            system_fingerprint="",
+            object="chat.completion.chunk",
+        )
+        return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-        return f"data: {json.dumps(payload)}\n\n"
-
-    def build_responses_chunk(self, response: BaseModel) -> str:
-        return f"data: {response.model_dump_json()}\n\n"
+    def build_responses_event(self, response: BaseModel) -> str:
+        return f"data: {response.model_dump_json(exclude_none=True)}\n\n"
 
     def run(self):
         app = FastAPI()
@@ -476,20 +433,30 @@ class ServeCommand(BaseTransformersCLICommand):
             )
 
         @app.post("/v1/chat/completions")
-        def chat_completion(req: ChatCompletionInput):
-            if not req.stream:
-                return {"error": "Only streaming mode is supported."}
+        def chat_completion(request: dict):
+            self.validate_request(
+                request=request,
+                schema=TransformersCompletionCreateParamsStreaming,
+                validator=completion_validator,
+                unused_fields=UNUSED_COMPLETION_FIELDS,
+            )
 
-            output = self.continuous_batching(req) if self.use_continuous_batching else self.generate(req)
-
+            if self.use_continuous_batching:
+                output = self.continuous_batching_completion(request)
+            else:
+                output = self.generate_completion(request)
             return StreamingResponse(output, media_type="text/event-stream")
 
         @app.post("/v1/responses")
-        def responses(req: ResponsesInput):
-            if not req.stream:
-                return {"error": "Only streaming mode is supported."}
+        def responses(request: dict):
+            self.validate_request(
+                request=request,
+                schema=TransformersResponseCreateParamsStreaming,
+                validator=response_validator,
+                unused_fields=UNUSED_RESPONSE_FIELDS,
+            )
 
-            output = self.generate_response(req)
+            output = self.generate_response(request)
             return StreamingResponse(output, media_type="text/event-stream")
 
         @app.get("/v1/models")
@@ -532,14 +499,15 @@ class ServeCommand(BaseTransformersCLICommand):
             model_info("meta-llama/Llama-3.3-70B-Instruct"),
         ]
 
-    def continuous_batching(self, req: ChatCompletionInput) -> Generator:
-        update_model = self.canonicalized_model_name(req.model) != self.loaded_model
+    def continuous_batching_completion(self, req: dict) -> Generator:
+        update_model = self.canonicalized_model_name(req["model"]) != self.loaded_model
 
         if update_model:
-            self.model, self.tokenizer = self.load_model_and_tokenizer(req.model, self.args)
+            self.model, self.tokenizer = self.load_model_and_tokenizer(req["model"], self.args)
 
         generation_config = create_generation_config_from_req(
             req,
+            model_generation_config=self.model.generation_config,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
             use_cache=False,
@@ -561,51 +529,53 @@ class ServeCommand(BaseTransformersCLICommand):
             self.running_continuous_batching_manager.start()
 
         # TODO (Joao, Lysandre): this should also work with tool support
-        inputs = self.tokenizer.apply_chat_template(req.messages, return_tensors="pt", add_generation_prompt=True).to(
-            self.model.device
-        )
+        inputs = self.tokenizer.apply_chat_template(
+            req["messages"], return_tensors="pt", add_generation_prompt=True
+        ).to(self.model.device)
 
-        def stream_response(_inputs):
+        def stream_chat_completion(_inputs):
             try:
-                max_new_tokens = req.max_tokens or generation_config.max_new_tokens or 1024
+                max_new_tokens = req.get("max_tokens", generation_config.max_new_tokens) or 1024
                 request_id = self.running_continuous_batching_manager.add_request(
-                    _inputs, request_id=req.request_id, max_new_tokens=max_new_tokens
+                    _inputs, request_id=req.get("request_id"), max_new_tokens=max_new_tokens
                 )
 
                 queue_is_flushed = False
 
+                # Emit the assistant role to start the stream. Other chunks won't have a role, as it is implicit
+                # they come from the assistant.
+                yield self.build_chat_completions_chunk(request_id, role="assistant")
+
                 for result in self.running_continuous_batching_manager:
                     if result.request_id != request_id:
                         continue
-                    if req.request_id is not None and not queue_is_flushed:
+                    if req.get("request_id") is not None and not queue_is_flushed:
                         if result.status == RequestStatus.FINISHED:
                             continue
                         else:
                             queue_is_flushed = True
 
                     finish_reason = "stop" if result.status == RequestStatus.FINISHED else None
-                    yield self.build_chat_completions_chunk(
-                        content=result.next_token, request_id=request_id, finish_reason=finish_reason
-                    )
-
                     if result.status == RequestStatus.FINISHED:
+                        yield self.build_chat_completions_chunk(request_id, finish_reason=finish_reason)
                         break
+                    else:
+                        yield self.build_chat_completions_chunk(request_id=request_id, content=result.next_token)
 
-                yield "data: [DONE]\n\n"
             except Exception as e:
                 logger.error(str(e))
                 yield f'data: {{"error": "{str(e)}"}}'
 
-        return stream_response(inputs[0])
+        return stream_chat_completion(inputs[0])
 
-    def generate(self, req: ChatCompletionInput) -> Generator:
-        update_model = req.model != self.loaded_model
+    def generate_completion(self, req: dict) -> Generator:
+        update_model = req["model"] != self.loaded_model
         if update_model:
-            self.model, self.tokenizer = self.load_model_and_tokenizer(req.model, self.args)
+            self.model, self.tokenizer = self.load_model_and_tokenizer(req["model"], self.args)
 
         # HACK for tiny-agents: it sends a request after the assistant message (???). Let's assume we can't have a
         # request whose last message is from the assistant.
-        if req.messages[-1].role == "assistant":
+        if req["messages"][-1]["role"] == "assistant":
             return
 
         # ====== TOOL PREPROCESSING LOGIC ======
@@ -621,18 +591,20 @@ class ServeCommand(BaseTransformersCLICommand):
 
         if tool_model_family is not None:
             text = self.tokenizer.apply_chat_template(
-                req.messages, add_generation_prompt=True, tokenize=False, tools=req.tools
+                req["messages"], add_generation_prompt=True, tokenize=False, tools=req.get("tools")
             )
         else:
-            text = self.tokenizer.apply_chat_template(req.messages, add_generation_prompt=True, tokenize=False)
+            text = self.tokenizer.apply_chat_template(req["messages"], add_generation_prompt=True, tokenize=False)
 
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)["input_ids"]
-        request_id = req.request_id if req.request_id is not None else "req_0"
+        request_id = req.get("request_id", "req_0")
 
         generation_streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
 
-        generation_config = create_generation_config_from_req(req)
-        max_new_tokens = req.max_tokens or generation_config.max_new_tokens or 256
+        generation_config = create_generation_config_from_req(
+            req, model_generation_config=self.model.generation_config
+        )
+        max_new_tokens = req.get("max_tokens", generation_config.max_new_tokens) or 256
         generation_config.max_new_tokens = max_new_tokens
 
         last_kv_cache = None
@@ -648,7 +620,7 @@ class ServeCommand(BaseTransformersCLICommand):
             "past_key_values": last_kv_cache,
         }
 
-        def stream_response(streamer, _request_id):
+        def stream_chat_completion(streamer, _request_id):
             # Thin wrapper to save the KV cache after generation
             def generate_with_cache(**kwargs):
                 generate_output = self.model.generate(**kwargs)
@@ -659,6 +631,10 @@ class ServeCommand(BaseTransformersCLICommand):
             try:
                 thread.start()
                 tool_state = ToolState()
+
+                # Emit the assistant role to start the stream. Other chunks won't have a role, as it is implicit
+                # they come from the assistant.
+                yield self.build_chat_completions_chunk(request_id, role="assistant")
 
                 for result in streamer:
                     # ====== TOOL CALL LOGIC ======
@@ -689,11 +665,8 @@ class ServeCommand(BaseTransformersCLICommand):
                                 else:
                                     tool_name = tool_name.group(1)
                                 tool_state.has_tool_name_defined = True
-                                tool = ChatCompletionStreamOutputDeltaToolCall(
-                                    function=ChatCompletionStreamOutputFunction(
-                                        name=tool_name,
-                                        arguments=None,
-                                    ),
+                                tool = ChoiceDeltaToolCall(
+                                    function=ChoiceDeltaToolCallFunction(name=tool_name),
                                     index=0,
                                     type="function",
                                     id=_request_id + "_tool_call",  # Only the first tool call delta has an id
@@ -717,13 +690,10 @@ class ServeCommand(BaseTransformersCLICommand):
                                 if tool_state.arg_nesting_level < 0:
                                     result = "".join(result.split("}")[:-2]) + "}"  # e.g. "4}}\n" -> "4}"
 
-                                tool = ChatCompletionStreamOutputDeltaToolCall(
-                                    function=ChatCompletionStreamOutputFunction(
-                                        arguments=result,
-                                    ),
+                                tool = ChoiceDeltaToolCall(
+                                    function=ChoiceDeltaToolCallFunction(arguments=result),
                                     index=0,
                                     type="function",
-                                    id=None,
                                 )
 
                             yield self.build_chat_completions_chunk(
@@ -732,9 +702,10 @@ class ServeCommand(BaseTransformersCLICommand):
                             continue
                     # ====== END OF TOOL CALL LOGIC ======
 
-                    # All non-tool related tokens are emitted as assistant messages
-                    yield self.build_chat_completions_chunk(content=result, request_id=_request_id, role="assistant")
-                yield self.build_chat_completions_chunk(request_id=_request_id, role=None, finish_reason="stop")
+                    # All non-tool related tokens are emitted as assistant messages. Empty text is skipped.
+                    if result != "":
+                        yield self.build_chat_completions_chunk(_request_id, content=result)
+                yield self.build_chat_completions_chunk(_request_id, finish_reason="stop")
 
                 thread.join()
             except Exception as e:
@@ -745,9 +716,9 @@ class ServeCommand(BaseTransformersCLICommand):
             finally:
                 thread.join()
 
-        return stream_response(generation_streamer, request_id)
+        return stream_chat_completion(generation_streamer, request_id)
 
-    def generate_response(self, req: ResponsesInput) -> Generator:
+    def generate_response(self, req: dict) -> Generator:
         # TODO
         # Check generation config parameters
         # Implement KV caching (with previous_request_id?)
@@ -755,19 +726,21 @@ class ServeCommand(BaseTransformersCLICommand):
         # Implement non-streaming mode
         # Implement different output_index and content_index than 0
 
-        update_model = req.model != self.loaded_model
+        update_model = req["model"] != self.loaded_model
         if update_model:
-            self.model, self.tokenizer = self.load_model_and_tokenizer(req.model, self.args)
+            self.model, self.tokenizer = self.load_model_and_tokenizer(req["model"], self.args)
 
-        text = self.tokenizer.apply_chat_template(req.input, add_generation_prompt=True, tokenize=False)
+        text = self.tokenizer.apply_chat_template(req["input"], add_generation_prompt=True, tokenize=False)
 
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)["input_ids"]
-        request_id = req.previous_response_id if req.previous_response_id is not None else "req_0"
+        request_id = req.get("previous_response_id", "req_0")
 
         generation_streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
 
-        generation_config = create_generation_config_from_req(req)
-        max_new_tokens = req.max_output_tokens or generation_config.max_new_tokens or 256
+        generation_config = create_generation_config_from_req(
+            req, model_generation_config=self.model.generation_config
+        )
+        max_new_tokens = req.get("max_output_tokens", generation_config.max_new_tokens) or 256
         generation_config.max_new_tokens = max_new_tokens
 
         generation_kwargs = {
@@ -780,114 +753,155 @@ class ServeCommand(BaseTransformersCLICommand):
 
         def stream_response(streamer, _request_id):
             thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+            sequence_number = 0
 
             try:
                 thread.start()
+                created_at = time.time()  # the spec expects a unix timestamp in seconds
 
-                created_at = time.time_ns()
-
-                response_created = Response(
+                # We start by acknowledging the request (the request has `status="queued"`), and then by moving it to
+                # in progress (`status="in_progress"`)
+                response_created = ResponseCreatedEvent(
                     type="response.created",
-                    response=ResponsesOutput(
+                    sequence_number=sequence_number,
+                    response=Response(
                         id=f"resp_{request_id}",
                         created_at=created_at,
-                        status="in_progress",
+                        status="queued",
                         model=self.loaded_model,
-                        instructions=req.instructions,
+                        instructions=req.get("instructions"),
                         text={"format": {"type": "text"}},
+                        object="response",
+                        tools=[],
+                        output=[],
+                        parallel_tool_calls=False,
+                        tool_choice="auto",
                     ),
                 )
-                yield self.build_responses_chunk(response_created)
+                sequence_number += 1
+                yield self.build_responses_event(response_created)
 
-                response_in_progress = Response(
+                response_in_progress = ResponseInProgressEvent(
                     type="response.in_progress",
-                    response=ResponsesOutput(
+                    sequence_number=sequence_number,
+                    response=Response(
                         id=f"resp_{request_id}",
                         created_at=created_at,
                         status="in_progress",
                         model=self.loaded_model,
-                        instructions=req.instructions,
+                        instructions=req.get("instructions"),
                         text={"format": {"type": "text"}},
+                        object="response",
+                        tools=[],
+                        output=[],
+                        parallel_tool_calls=False,
+                        tool_choice="auto",
                     ),
                 )
-                yield self.build_responses_chunk(response_in_progress)
+                sequence_number += 1
+                yield self.build_responses_event(response_in_progress)
 
-                response_output_item_added = ResponseOutputItemAdded(
-                    type="response.output_item_added",
+                # Start the output item. Emit the assistant role to start the stream. Other chunks won't have a role,
+                # as it is implicit
+                response_output_item_added = ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    sequence_number=sequence_number,
                     output_index=0,
-                    item=ResponseOutputItem(
+                    item=ResponseOutputMessage(
                         id=f"msg_{request_id}", type="message", status="in_progress", role="assistant", content=[]
                     ),
                 )
-                yield self.build_responses_chunk(response_output_item_added)
+                sequence_number += 1
+                yield self.build_responses_event(response_output_item_added)
 
-                response_content_part_added = ResponseContentPartAdded(
+                # Start the content part of the event
+                response_content_part_added = ResponseContentPartAddedEvent(
                     type="response.content_part.added",
                     item_id=f"msg_{request_id}",
+                    sequence_number=sequence_number,
                     output_index=0,
                     content_index=0,
-                    part=ResponsesOutputContent(type="output_text", text="", annotations=[]),
+                    part=ResponseOutputText(type="output_text", text="", annotations=[]),
                 )
-                yield self.build_responses_chunk(response_content_part_added)
+                sequence_number += 1
+                yield self.build_responses_event(response_content_part_added)
 
+                # Stream the actual generated text
                 results = ""
                 for result in streamer:
                     results += result
-                    response_output_text_delta = ResponseOutputTextDelta(
-                        type="response.output_text_delta",
+                    response_output_text_delta = ResponseTextDeltaEvent(
+                        type="response.output_text.delta",
                         item_id=f"msg_{request_id}",
+                        sequence_number=sequence_number,
                         output_index=0,
                         content_index=0,
                         delta=result,
                     )
-                    yield self.build_responses_chunk(response_output_text_delta)
+                    sequence_number += 1
+                    yield self.build_responses_event(response_output_text_delta)
 
-                response_output_text_done = ResponseOutputTextDone(
-                    type="response.output_text_done",
+                # Signal the end of the text generation
+                response_output_text_done = ResponseTextDoneEvent(
+                    type="response.output_text.done",
                     item_id=f"msg_{request_id}",
+                    sequence_number=sequence_number,
                     output_index=0,
                     content_index=0,
                     text=results,
                 )
-                yield self.build_responses_chunk(response_output_text_done)
+                sequence_number += 1
+                yield self.build_responses_event(response_output_text_done)
 
-                response_content_part_done = ResponseContentPartDone(
-                    type="response.content_part_done",
+                # Complete the content part
+                response_content_part_done = ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
                     item_id=f"msg_{request_id}",
+                    sequence_number=sequence_number,
                     output_index=0,
                     content_index=0,
-                    part=ResponsesOutputContent(
-                        type="output_text", text=response_output_text_done.text, annotations=[]
-                    ),
+                    part=ResponseOutputText(type="output_text", text=response_output_text_done.text, annotations=[]),
                 )
-                yield self.build_responses_chunk(response_content_part_done)
+                sequence_number += 1
+                yield self.build_responses_event(response_content_part_done)
 
-                response_output_item_done = ResponseOutputItemDone(
-                    type="response.output_item_done",
+                # Complete the output item
+                response_output_item_done = ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=sequence_number,
                     output_index=0,
-                    item=ResponseOutputItem(
+                    item=ResponseOutputMessage(
                         id=f"msg_{request_id}",
                         type="message",
                         status="completed",
                         role="assistant",
                         content=[response_content_part_done.part],
+                        annotations=[],
                     ),
                 )
-                yield self.build_responses_chunk(response_output_item_done)
+                sequence_number += 1
+                yield self.build_responses_event(response_output_item_done)
 
-                response_completed = Response(
+                # Finally, Complete the event
+                response_completed = ResponseCompletedEvent(
                     type="response.completed",
-                    response=ResponsesOutput(
+                    sequence_number=sequence_number,
+                    response=Response(
                         id=f"resp_{request_id}",
                         created_at=created_at,
                         status="completed",
                         model=self.loaded_model,
-                        instructions=req.instructions,
+                        instructions=req.get("instructions"),
                         text={"format": {"type": "text"}},
-                        output=response_output_item_done.item,
+                        output=[response_output_item_done.item],
+                        object="response",
+                        tools=[],
+                        parallel_tool_calls=False,
+                        tool_choice="auto",
                     ),
                 )
-                yield self.build_responses_chunk(response_completed)
+                sequence_number += 1
+                yield self.build_responses_event(response_completed)
 
                 thread.join()
             except Exception as e:
@@ -899,13 +913,13 @@ class ServeCommand(BaseTransformersCLICommand):
 
         return stream_response(generation_streamer, request_id)
 
-    def is_continuation(self, req: "ChatCompletionInput") -> bool:
+    def is_continuation(self, req: dict) -> bool:
         """
         Determines whether the current request is a continuation of the last request. In other words, if it is the
         same chat session.
 
         Args:
-            req (`ChatCompletionInput`): The request to check.
+            req (`dict`): The request to check.
 
         Returns:
             `True` if the request is a continuation of the last request, `False` otherwise.
@@ -916,16 +930,16 @@ class ServeCommand(BaseTransformersCLICommand):
         if self.last_messages is None:
             req_continues_last_messages = False
         # The new request has no new rounds of conversation: this is a new request
-        elif len(self.last_messages) >= len(req.messages):
+        elif len(self.last_messages) >= len(req["messages"]):
             req_continues_last_messages = False
         # Otherwise, check that the last messages are a subset of the new request
         else:
             for i in range(len(self.last_messages)):
-                if self.last_messages[i] != req.messages[i]:
+                if self.last_messages[i] != req["messages"][i]:
                     req_continues_last_messages = False
                     break
 
-        self.last_messages = req.messages
+        self.last_messages = req["messages"]
         return req_continues_last_messages
 
     @staticmethod
