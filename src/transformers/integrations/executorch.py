@@ -275,13 +275,13 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
 
         self.model = model
         self.static_cache = StaticCache(
-            config=self.model.config,
-            max_batch_size=self.model.generation_config.cache_config.batch_size,
-            max_cache_len=self.model.generation_config.cache_config.max_cache_len,
-            device=self.model.generation_config.cache_config.device,
+            model_config=self.model.config,
+            max_batch_size=self.model.generation_config.cache_config.get("batch_size"),
+            max_cache_len=self.model.generation_config.cache_config.get("max_cache_len"),
+            device=self.model.generation_config.cache_config.get("device"),
             dtype=self.model.dtype,
         )
-        for i in range(len(self.static_cache.key_cache)):
+        for i in range(len(self.static_cache)):
             self.register_buffer(f"key_cache_{i}", self.static_cache.key_cache[i], persistent=False)
             self.register_buffer(f"value_cache_{i}", self.static_cache.value_cache[i], persistent=False)
 
@@ -404,7 +404,7 @@ class TorchExportableModuleWithHybridCache(torch.nn.Module):
 
         # Initialize the HybridCache
         self.cache = HybridCache(
-            config=self.model.config,
+            model_config=self.model.config,
             max_batch_size=max_batch_size,
             max_cache_len=max_cache_len,
             device=self.model.device,
@@ -412,7 +412,7 @@ class TorchExportableModuleWithHybridCache(torch.nn.Module):
         )
 
         # Register all key and value cache tensors as buffers
-        for i in range(len(self.cache.key_cache)):
+        for i in range(len(self.cache)):
             self.register_buffer(f"key_cache_{i}", self.cache.key_cache[i], persistent=False)
             self.register_buffer(f"value_cache_{i}", self.cache.value_cache[i], persistent=False)
 
@@ -550,7 +550,7 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
 
         # Initialize static cache for decoder and DynamicCache for encoder
         self.static_cache = StaticCache(
-            config=self.config,
+            model_config=self.config,
             max_batch_size=batch_size,
             max_cache_len=max_static_cache_length,
             device="cpu",
@@ -559,7 +559,7 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
         self.cache = EncoderDecoderCache(self.static_cache, DynamicCache())
 
         # Register cache buffers to make them exportable
-        for i in range(len(self.static_cache.key_cache)):
+        for i in range(len(self.static_cache)):
             self.register_buffer(f"key_cache_{i}", self.static_cache.key_cache[i], persistent=False)
             self.register_buffer(f"value_cache_{i}", self.static_cache.value_cache[i], persistent=False)
 
