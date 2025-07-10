@@ -113,6 +113,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("dots1", "Dots1Model"),
         ("dpr", "DPRQuestionEncoder"),
         ("dpt", "DPTModel"),
+        ("dust3r", "Dust3RModel"),
         ("efficientformer", "EfficientFormerModel"),
         ("efficientnet", "EfficientNetModel"),
         ("electra", "ElectraModel"),
@@ -701,6 +702,7 @@ MODEL_FOR_IMAGE_MAPPING_NAMES = OrderedDict(
         ("dinov2", "Dinov2Model"),
         ("dinov2_with_registers", "Dinov2WithRegistersModel"),
         ("dpt", "DPTModel"),
+        ("dust3r", "Dust3RModel"),
         ("efficientformer", "EfficientFormerModel"),
         ("efficientnet", "EfficientNetModel"),
         ("focalnet", "FocalNetModel"),
@@ -746,6 +748,7 @@ MODEL_FOR_IMAGE_MAPPING_NAMES = OrderedDict(
 MODEL_FOR_MASKED_IMAGE_MODELING_MAPPING_NAMES = OrderedDict(
     [
         ("deit", "DeiTForMaskedImageModeling"),
+        ("dust3r", "Dust3RForMaskedImageModeling"),
         ("focalnet", "FocalNetForMaskedImageModeling"),
         ("swin", "SwinForMaskedImageModeling"),
         ("swinv2", "Swinv2ForMaskedImageModeling"),
@@ -779,6 +782,7 @@ MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES = OrderedDict(
         ("dinov2", "Dinov2ForImageClassification"),
         ("dinov2_with_registers", "Dinov2WithRegistersForImageClassification"),
         ("donut-swin", "DonutSwinForImageClassification"),
+
         (
             "efficientformer",
             (
