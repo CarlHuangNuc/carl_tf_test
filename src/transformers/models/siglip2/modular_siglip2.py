@@ -270,7 +270,8 @@ class Siglip2VisionTransformer(SiglipVisionTransformer):
 
         last_hidden_state = encoder_outputs.last_hidden_state
         last_hidden_state = self.post_layernorm(last_hidden_state)
-
+        # The pooled output is taken from the last token, which may be <pad> or <eos>.
+        # This follows SigLIP2's original training setup, where attention masks are not used.
         pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
 
         return BaseModelOutputWithPooling(
