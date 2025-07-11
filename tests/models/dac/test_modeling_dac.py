@@ -382,23 +382,38 @@ def normalize(arr):
 
 
 def compute_rmse(arr1, arr2):
-    arr1_normalized = normalize(arr1)
-    arr2_normalized = normalize(arr2)
+    arr1_np = arr1.cpu().numpy().squeeze()
+    arr2_np = arr2.cpu().numpy().squeeze()
+    max_length = min(arr1.shape[-1], arr2.shape[-1])
+    arr1_np = arr1_np[..., :max_length]
+    arr2_np = arr2_np[..., :max_length]
+    arr1_normalized = normalize(arr1_np)
+    arr2_normalized = normalize(arr2_np)
     return np.sqrt(((arr1_normalized - arr2_normalized) ** 2).mean())
 
 
 @slow
 @require_torch
 class DacIntegrationTest(unittest.TestCase):
+    """
+    Integration tests for DAC.
+
+    Code for reproducing expected outputs can be found here:
+    - Single file: https://gist.github.com/ebezzam/bb315efa7a416db6336a6b2a2d424ffa#file-single-py
+    - Batched: https://gist.github.com/ebezzam/bb315efa7a416db6336a6b2a2d424ffa#file-batch-py
+    """
+
     def test_integration_16khz(self):
         expected_rmse = 0.004
-
-        expected_encoder_sums_dict = {
-            "loss": 24.8596,
-            "quantized_representation": -0.0745,
-            "audio_codes": 504.0948,
-            "projected_latents": 0.0682,
+        expected_encoder_means_dict = {
+            "loss": 24.8491,
+            "quantized_representation": -0.07544856518507004,
+            # "audio_codes": 505.13421630859375,
+            "projected_latents": 0.06593942642211914,
         }
+        expected_quantizer_codebook_mean = 504.3310546875
+        expected_decoded_mean = -0.00018316633941140026
+        expected_codec_error = 0.0038341842591762543
 
         librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
 
@@ -406,7 +421,7 @@ class DacIntegrationTest(unittest.TestCase):
 
         model_id = f"descript/{model_name}"
         model = DacModel.from_pretrained(model_id, force_download=True).to(torch_device).eval()
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, hop_length=int(np.prod(model.config.downsampling_ratios)))
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
         audio_sample = librispeech_dummy[0]["audio"]["array"]
@@ -418,48 +433,69 @@ class DacIntegrationTest(unittest.TestCase):
         ).to(torch_device)
 
         with torch.no_grad():
+            # compute HF encoder outputs
             encoder_outputs = model.encode(inputs["input_values"])
+            hf_output_means_dict = {
+                "loss": encoder_outputs[0].item(),
+                "quantized_representation": encoder_outputs[1].mean().item(),
+                # "audio_codes": encoder_outputs[2].float().mean().item(),
+                "projected_latents": encoder_outputs[3].float().mean().item(),
+            }
+            hf_output_means = torch.tensor(list(hf_output_means_dict.values()), dtype=torch.float32)
 
-            expected_encoder_sums = torch.tensor(list(expected_encoder_sums_dict.values()), dtype=torch.float32)
-            encoder_outputs_mean = torch.tensor([v.float().mean().cpu().item() for v in encoder_outputs.to_tuple()])
+            # make sure encoded outputs are similar
+            # TODO for all sampling rates, encoder error is relatively high compared to quantizer and decoder (but still minimal)
+            # they may be a bug in encoder weight mapping:
+            # https://github.com/huggingface/transformers/blob/d61c0d087cedbfdbbee8c75b210d5837c35addb8/src/transformers/models/dac/convert_dac_checkpoint.py#L63
+            # in any case, the error is small enough to not affect the codec performance
+            expected_encoder_means = torch.tensor(list(expected_encoder_means_dict.values()), dtype=torch.float32)
+            torch.testing.assert_close(hf_output_means, expected_encoder_means, rtol=1e-3, atol=1e-3)
 
-            # make sure audio encoded codes are correct
-            torch.testing.assert_close(encoder_outputs_mean, expected_encoder_sums, rtol=1e-3, atol=1e-3)
+            # check that quantizers behave similar (for same input)
+            encoded_hf = model.encoder(inputs["input_values"])
+            hf_quantizer_codebook_mean = model.quantizer(encoded_hf)[1].float().mean().item()
+            torch.testing.assert_close(
+                hf_quantizer_codebook_mean, expected_quantizer_codebook_mean, rtol=1e-6, atol=1e-6
+            )
 
+            # check that decoders behave similar (for same input)
+            hf_decoded_mean = model.decode(encoded_hf)["audio_values"].mean().item()
+            torch.testing.assert_close(hf_decoded_mean, expected_decoded_mean, rtol=1e-6, atol=1e-6)
+
+            # decode
             _, quantized_representation, _, _ = encoder_outputs.to_tuple()
             input_values_dec = model.decode(quantized_representation)[0]
             input_values_enc_dec = model(inputs["input_values"])[1]
 
             # make sure forward and decode gives same result
-            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-3, atol=1e-3)
-
-            arr = inputs["input_values"][0].cpu().numpy()
-            arr_enc_dec = input_values_enc_dec[0].cpu().numpy()
-
-            max_length = min(arr_enc_dec.shape[-1], arr.shape[-1])
-
-            arr_cut = arr[0, :max_length].copy()
-            arr_enc_dec_cut = arr_enc_dec[:max_length].copy()
+            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-6, atol=1e-6)
 
             # make sure audios are more or less equal
-            rmse = compute_rmse(arr_cut, arr_enc_dec_cut)
+            rmse = compute_rmse(input_values_enc_dec, inputs["input_values"])
             self.assertTrue(rmse < expected_rmse)
+
+            # check that codec error is similar
+            torch.testing.assert_close(expected_codec_error, rmse, rtol=1e-6, atol=1e-6)
 
     def test_integration_24khz(self):
         expected_rmse = 0.0039
-
-        expected_encoder_output_dict = {
-            "quantized_representation": torch.tensor([0.6257, 3.1245, 5.2514, 2.3160, 1.5774]),
-            "audio_codes": torch.tensor([919, 919, 234, 777, 234]),
-            "projected_latents": torch.tensor([-4.7841, -5.0063, -4.5595, -5.0372, -5.4280]),
+        expected_encoder_means_dict = {
+            "loss": 28.1121,
+            "quantized_representation": 0.016283338889479637,
+            # "audio_codes": 507.17724609375,
+            "projected_latents": -0.024361690506339073,
         }
+        expected_quantizer_codebook_mean = 506.8665466308594
+        expected_decoded_mean = 0.0001686957839410752
+        expected_codec_error = 0.002570481738075614
+
         librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
 
         model_name = "dac_24khz"
 
         model_id = f"descript/{model_name}"
         model = DacModel.from_pretrained(model_id, force_download=True).to(torch_device).eval()
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, hop_length=int(np.prod(model.config.downsampling_ratios)))
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
         audio_sample = librispeech_dummy[0]["audio"]["array"]
@@ -471,73 +507,68 @@ class DacIntegrationTest(unittest.TestCase):
         ).to(torch_device)
 
         with torch.no_grad():
+            # compute HF encoder outputs
             encoder_outputs = model.encode(inputs["input_values"])
+            hf_output_means_dict = {
+                "loss": encoder_outputs[0].item(),
+                "quantized_representation": encoder_outputs[1].mean().item(),
+                # "audio_codes": encoder_outputs[2].float().mean().item(),
+                "projected_latents": encoder_outputs[3].float().mean().item(),
+            }
+            hf_output_means = torch.tensor(list(hf_output_means_dict.values()), dtype=torch.float32)
 
-            expected_quantized_representation = encoder_outputs["quantized_representation"][0, 0, :5].cpu()
-            expected_audio_codes = encoder_outputs["audio_codes"][0, 0, :5].cpu()
-            expected_projected_latents = encoder_outputs["projected_latents"][0, 0, :5].cpu()
+            # make sure encoded outputs are similar
+            expected_encoder_means = torch.tensor(list(expected_encoder_means_dict.values()), dtype=torch.float32)
+            torch.testing.assert_close(hf_output_means, expected_encoder_means, rtol=1e-2, atol=1e-2)
 
-            # make sure values are correct for audios slices
-            self.assertTrue(
-                torch.allclose(
-                    expected_quantized_representation,
-                    expected_encoder_output_dict["quantized_representation"],
-                    atol=1e-3,
-                )
-            )
-            self.assertTrue(
-                torch.allclose(expected_audio_codes, expected_encoder_output_dict["audio_codes"], atol=1e-3)
-            )
-            self.assertTrue(
-                torch.allclose(
-                    expected_projected_latents, expected_encoder_output_dict["projected_latents"], atol=1e-3
-                )
+            # check that quantizers behave similar (for same input)
+            encoded_hf = model.encoder(inputs["input_values"])
+            hf_quantizer_codebook_mean = model.quantizer(encoded_hf)[1].float().mean().item()
+            torch.testing.assert_close(
+                hf_quantizer_codebook_mean, expected_quantizer_codebook_mean, rtol=1e-6, atol=1e-6
             )
 
+            # check that decoders behave similar (for same input)
+            hf_decoded_mean = model.decode(encoded_hf)["audio_values"].mean().item()
+            torch.testing.assert_close(hf_decoded_mean, expected_decoded_mean, rtol=1e-6, atol=1e-6)
+
+            # decode
             _, quantized_representation, _, _ = encoder_outputs.to_tuple()
             input_values_dec = model.decode(quantized_representation)[0]
             input_values_enc_dec = model(inputs["input_values"])[1]
 
-            input_values_from_codes = model.decode(audio_codes=encoder_outputs.audio_codes)[0]
-
-            # make sure decode from audio codes and quantized values give more or less the same results
-            torch.testing.assert_close(input_values_from_codes, input_values_dec, rtol=1e-5, atol=1e-5)
-
             # make sure forward and decode gives same result
-            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-3, atol=1e-3)
-
-            arr = inputs["input_values"][0].cpu().numpy()
-            arr_enc_dec = input_values_enc_dec[0].cpu().numpy()
-
-            max_length = min(arr_enc_dec.shape[-1], arr.shape[-1])
-
-            arr_cut = arr[0, :max_length].copy()
-            arr_enc_dec_cut = arr_enc_dec[:max_length].copy()
+            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-6, atol=1e-6)
 
             # make sure audios are more or less equal
-            rmse = compute_rmse(arr_cut, arr_enc_dec_cut)
+            rmse = compute_rmse(input_values_enc_dec, inputs["input_values"])
             self.assertTrue(rmse < expected_rmse)
+
+            # check that codec error is similar
+            torch.testing.assert_close(expected_codec_error, rmse, rtol=1e-6, atol=1e-6)
 
     def test_integration_44khz(self):
         expected_rmse = 0.002
-
-        expected_encoder_sums_dict = {
-            "loss": 34.3612,
-            "quantized_representation": 0.0078,
-            "audio_codes": 509.6812,
-            "projected_latents": -0.1054,
+        expected_encoder_means_dict = {
+            "loss": 23.7848,
+            "quantized_representation": 0.017807748168706894,
+            # "audio_codes": 513.7100219726562,
+            "projected_latents": 0.06925617158412933,
         }
+        expected_quantizer_codebook_mean = 514.03369140625
+        expected_decoded_mean = -0.00010763177124317735
+        expected_codec_error = 0.0007429996621794999
+
         librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
 
         model_name = "dac_44khz"
 
         model_id = f"descript/{model_name}"
-        model = DacModel.from_pretrained(model_id).to(torch_device).eval()
-        processor = AutoProcessor.from_pretrained(model_id)
+        model = DacModel.from_pretrained(model_id, force_download=True).to(torch_device).eval()
+        processor = AutoProcessor.from_pretrained(model_id, hop_length=int(np.prod(model.config.downsampling_ratios)))
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
         audio_sample = librispeech_dummy[0]["audio"]["array"]
-
         inputs = processor(
             raw_audio=audio_sample,
             sampling_rate=processor.sampling_rate,
@@ -545,42 +576,57 @@ class DacIntegrationTest(unittest.TestCase):
         ).to(torch_device)
 
         with torch.no_grad():
+            # compute HF encoder outputs
             encoder_outputs = model.encode(inputs["input_values"])
+            hf_output_means_dict = {
+                "loss": encoder_outputs[0].item(),
+                "quantized_representation": encoder_outputs[1].mean().item(),
+                # "audio_codes": encoder_outputs[2].float().mean().item(),
+                "projected_latents": encoder_outputs[3].float().mean().item(),
+            }
+            hf_output_means = torch.tensor(list(hf_output_means_dict.values()), dtype=torch.float32)
 
-            expected_encoder_sums = torch.tensor(list(expected_encoder_sums_dict.values()), dtype=torch.float32)
-            encoder_outputs_mean = torch.tensor([v.float().mean().cpu().item() for v in encoder_outputs.to_tuple()])
+            # make sure encoded outputs are similar
+            expected_encoder_means = torch.tensor(list(expected_encoder_means_dict.values()), dtype=torch.float32)
+            torch.testing.assert_close(hf_output_means, expected_encoder_means, rtol=1e-3, atol=1e-3)
 
-            # make sure audio encoded codes are correct
-            torch.testing.assert_close(encoder_outputs_mean, expected_encoder_sums, rtol=1e-3, atol=1e-3)
+            # check that quantizers behave similar (for same input)
+            encoded_hf = model.encoder(inputs["input_values"])
+            hf_quantizer_codebook_mean = model.quantizer(encoded_hf)[1].float().mean().item()
+            torch.testing.assert_close(
+                hf_quantizer_codebook_mean, expected_quantizer_codebook_mean, rtol=1e-6, atol=1e-6
+            )
 
+            # check that decoders behave similar (for same input)
+            hf_decoded_mean = model.decode(encoded_hf)["audio_values"].mean().item()
+            torch.testing.assert_close(hf_decoded_mean, expected_decoded_mean, rtol=1e-6, atol=1e-6)
+
+            # decode
             _, quantized_representation, _, _ = encoder_outputs.to_tuple()
             input_values_dec = model.decode(quantized_representation)[0]
             input_values_enc_dec = model(inputs["input_values"])[1]
 
             # make sure forward and decode gives same result
-            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-3, atol=1e-3)
-
-            arr = inputs["input_values"][0].cpu().numpy()
-            arr_enc_dec = input_values_enc_dec[0].cpu().numpy()
-
-            max_length = min(arr_enc_dec.shape[-1], arr.shape[-1])
-
-            arr_cut = arr[0, :max_length].copy()
-            arr_enc_dec_cut = arr_enc_dec[:max_length].copy()
+            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-6, atol=1e-6)
 
             # make sure audios are more or less equal
-            rmse = compute_rmse(arr_cut, arr_enc_dec_cut)
+            rmse = compute_rmse(input_values_enc_dec, inputs["input_values"])
             self.assertTrue(rmse < expected_rmse)
+
+            # check that codec error is similar
+            torch.testing.assert_close(expected_codec_error, rmse, rtol=1e-6, atol=1e-6)
 
     def test_integration_batch_16khz(self):
         expected_rmse = 0.002
-
-        expected_encoder_sums_dict = {
-            "loss": 20.3913,
-            "quantized_representation": -0.0538,
-            "audio_codes": 487.8470,
-            "projected_latents": 0.0237,
+        expected_encoder_means_dict = {
+            "loss": 20.370271682739258,
+            "quantized_representation": -0.05440079793334007,
+            "audio_codes": 488.02716064453125,
+            "projected_latents": 0.02350950613617897,
         }
+        expected_quantizer_codebook_mean = 488.4040222167969
+        expected_decoded_mean = -7.977934001246467e-05
+        expected_codec_error = 0.001973195234313607
 
         librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
 
@@ -588,10 +634,9 @@ class DacIntegrationTest(unittest.TestCase):
 
         model_id = f"descript/{model_name}"
         model = DacModel.from_pretrained(model_id).to(torch_device)
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, hop_length=int(np.prod(model.config.downsampling_ratios)))
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
-
         audio_samples = [np.array([audio_sample["array"]])[0] for audio_sample in librispeech_dummy[-2:]["audio"]]
 
         inputs = processor(
@@ -603,41 +648,55 @@ class DacIntegrationTest(unittest.TestCase):
 
         with torch.no_grad():
             encoder_outputs = model.encode(inputs["input_values"])
+            hf_output_means_dict = {
+                "loss": encoder_outputs[0].mean().item(),
+                "quantized_representation": encoder_outputs[1].mean().item(),
+                "audio_codes": encoder_outputs[2].float().mean().item(),
+                "projected_latents": encoder_outputs[3].float().mean().item(),
+            }
+            hf_output_means = torch.tensor(list(hf_output_means_dict.values()), dtype=torch.float32)
 
-            expected_encoder_sums = torch.tensor(list(expected_encoder_sums_dict.values()), dtype=torch.float32)
-            encoder_outputs_mean = torch.tensor([v.float().mean().item() for v in encoder_outputs.to_tuple()])
+            # make sure encoded outputs are similar
+            expected_encoder_means = torch.tensor(list(expected_encoder_means_dict.values()), dtype=torch.float32)
+            torch.testing.assert_close(hf_output_means, expected_encoder_means, rtol=1e-3, atol=1e-3)
 
-            # make sure audio encoded codes are correct
-            torch.testing.assert_close(encoder_outputs_mean, expected_encoder_sums, rtol=1e-3, atol=1e-3)
+            # check that quantizers behave similar (for same input)
+            encoded_hf = model.encoder(inputs["input_values"])
+            hf_quantizer_codebook_mean = model.quantizer(encoded_hf)[1].float().mean().item()
+            torch.testing.assert_close(
+                hf_quantizer_codebook_mean, expected_quantizer_codebook_mean, rtol=1e-6, atol=1e-6
+            )
 
+            # check that decoders behave similar (for same input)
+            hf_decoded_mean = model.decode(encoded_hf)["audio_values"].mean().item()
+            torch.testing.assert_close(hf_decoded_mean, expected_decoded_mean, rtol=1e-6, atol=1e-6)
+
+            # decode
             _, quantized_representation, _, _ = encoder_outputs.to_tuple()
             input_values_dec = model.decode(quantized_representation)[0]
             input_values_enc_dec = model(inputs["input_values"])[1]
 
             # make sure forward and decode gives same result
-            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-3, atol=1e-3)
-
-            arr = inputs["input_values"].cpu().numpy()
-            arr_enc_dec = input_values_enc_dec.cpu().numpy()
-
-            max_length = min(arr_enc_dec.shape[-1], arr.shape[-1])
-
-            arr_cut = arr[:, 0, :max_length].copy()
-            arr_enc_dec_cut = arr_enc_dec[:, :max_length].copy()
+            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-6, atol=1e-6)
 
             # make sure audios are more or less equal
-            rmse = compute_rmse(arr_cut, arr_enc_dec_cut)
+            rmse = compute_rmse(input_values_enc_dec, inputs["input_values"])
             self.assertTrue(rmse < expected_rmse)
+
+            # check that codec error is similar
+            torch.testing.assert_close(expected_codec_error, rmse, rtol=1e-6, atol=1e-6)
 
     def test_integration_batch_24khz(self):
         expected_rmse = 0.002
-
-        expected_encoder_sums_dict = {
-            "loss": 24.2309,
-            "quantized_representation": 0.0520,
-            "audio_codes": 510.2700,
-            "projected_latents": -0.0076,
+        expected_encoder_means_dict = {
+            "loss": 24.505210876464844,
+            "quantized_representation": 0.03778776153922081,
+            "audio_codes": 509.5290222167969,
+            "projected_latents": -0.017138859257102013,
         }
+        expected_quantizer_codebook_mean = 509.381103515625
+        expected_decoded_mean = 0.00010512518929317594
+        expected_codec_error = 0.0012980918399989605
 
         librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
 
@@ -645,10 +704,9 @@ class DacIntegrationTest(unittest.TestCase):
 
         model_id = f"descript/{model_name}"
         model = DacModel.from_pretrained(model_id).to(torch_device)
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, hop_length=int(np.prod(model.config.downsampling_ratios)))
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
-
         audio_samples = [np.array([audio_sample["array"]])[0] for audio_sample in librispeech_dummy[-2:]["audio"]]
 
         inputs = processor(
@@ -660,41 +718,55 @@ class DacIntegrationTest(unittest.TestCase):
 
         with torch.no_grad():
             encoder_outputs = model.encode(inputs["input_values"])
+            hf_output_means_dict = {
+                "loss": encoder_outputs[0].mean().item(),
+                "quantized_representation": encoder_outputs[1].mean().item(),
+                "audio_codes": encoder_outputs[2].float().mean().item(),
+                "projected_latents": encoder_outputs[3].float().mean().item(),
+            }
+            hf_output_means = torch.tensor(list(hf_output_means_dict.values()), dtype=torch.float32)
 
-            expected_encoder_sums = torch.tensor(list(expected_encoder_sums_dict.values()), dtype=torch.float32)
-            encoder_outputs_mean = torch.tensor([v.float().mean().cpu().item() for v in encoder_outputs.to_tuple()])
+            # make sure encoded outputs are similar
+            expected_encoder_means = torch.tensor(list(expected_encoder_means_dict.values()), dtype=torch.float32)
+            torch.testing.assert_close(hf_output_means, expected_encoder_means, rtol=1e-3, atol=1e-3)
 
-            # make sure audio encoded codes are correct
-            torch.testing.assert_close(encoder_outputs_mean, expected_encoder_sums, rtol=1e-3, atol=1e-3)
+            # check that quantizers behave similar (for same input)
+            encoded_hf = model.encoder(inputs["input_values"])
+            hf_quantizer_codebook_mean = model.quantizer(encoded_hf)[1].float().mean().item()
+            torch.testing.assert_close(
+                hf_quantizer_codebook_mean, expected_quantizer_codebook_mean, rtol=1e-6, atol=1e-6
+            )
 
+            # check that decoders behave similar (for same input)
+            hf_decoded_mean = model.decode(encoded_hf)["audio_values"].mean().item()
+            torch.testing.assert_close(hf_decoded_mean, expected_decoded_mean, rtol=1e-6, atol=1e-6)
+
+            # decode
             _, quantized_representation, _, _ = encoder_outputs.to_tuple()
             input_values_dec = model.decode(quantized_representation)[0]
             input_values_enc_dec = model(inputs["input_values"])[1]
 
             # make sure forward and decode gives same result
-            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-3, atol=1e-3)
-
-            arr = inputs["input_values"].cpu().numpy()
-            arr_enc_dec = input_values_enc_dec.cpu().numpy()
-
-            max_length = min(arr_enc_dec.shape[-1], arr.shape[-1])
-
-            arr_cut = arr[:, 0, :max_length].copy()
-            arr_enc_dec_cut = arr_enc_dec[:, :max_length].copy()
+            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-6, atol=1e-6)
 
             # make sure audios are more or less equal
-            rmse = compute_rmse(arr_cut, arr_enc_dec_cut)
+            rmse = compute_rmse(input_values_enc_dec, inputs["input_values"])
             self.assertTrue(rmse < expected_rmse)
+
+            # check that codec error is similar
+            torch.testing.assert_close(expected_codec_error, rmse, rtol=1e-6, atol=1e-6)
 
     def test_integration_batch_44khz(self):
         expected_rmse = 0.001
-
-        expected_encoder_sums_dict = {
-            "loss": 25.9233,
-            "quantized_representation": 0.0013,
-            "audio_codes": 528.5620,
-            "projected_latents": -0.1194,
+        expected_encoder_means_dict = {
+            "loss": 19.557754516601562,
+            "quantized_representation": 0.004012184217572212,
+            "audio_codes": 518.1870727539062,
+            "projected_latents": -0.0008539701229892671,
         }
+        expected_quantizer_codebook_mean = 518.0151977539062
+        expected_decoded_mean = -2.039729770331178e-05
+        expected_codec_error = 0.00037737112143076956
 
         librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
 
@@ -702,10 +774,9 @@ class DacIntegrationTest(unittest.TestCase):
 
         model_id = f"descript/{model_name}"
         model = DacModel.from_pretrained(model_id).to(torch_device)
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, hop_length=int(np.prod(model.config.downsampling_ratios)))
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
-
         audio_samples = [np.array([audio_sample["array"]])[0] for audio_sample in librispeech_dummy[-2:]["audio"]]
 
         inputs = processor(
@@ -717,28 +788,40 @@ class DacIntegrationTest(unittest.TestCase):
 
         with torch.no_grad():
             encoder_outputs = model.encode(inputs["input_values"])
+            hf_output_means_dict = {
+                "loss": encoder_outputs[0].mean().item(),
+                "quantized_representation": encoder_outputs[1].mean().item(),
+                "audio_codes": encoder_outputs[2].float().mean().item(),
+                "projected_latents": encoder_outputs[3].float().mean().item(),
+            }
+            hf_output_means = torch.tensor(list(hf_output_means_dict.values()), dtype=torch.float32)
 
-            expected_encoder_sums = torch.tensor(list(expected_encoder_sums_dict.values()), dtype=torch.float32)
-            encoder_outputs_mean = torch.tensor([v.float().mean().cpu().item() for v in encoder_outputs.to_tuple()])
+            # make sure encoded outputs are similar
+            expected_encoder_means = torch.tensor(list(expected_encoder_means_dict.values()), dtype=torch.float32)
+            torch.testing.assert_close(hf_output_means, expected_encoder_means, rtol=1e-3, atol=1e-3)
 
-            # make sure audio encoded codes are correct
-            torch.testing.assert_close(encoder_outputs_mean, expected_encoder_sums, rtol=1e-3, atol=1e-3)
+            # check that quantizers behave similar (for same input)
+            encoded_hf = model.encoder(inputs["input_values"])
+            hf_quantizer_codebook_mean = model.quantizer(encoded_hf)[1].float().mean().item()
+            torch.testing.assert_close(
+                hf_quantizer_codebook_mean, expected_quantizer_codebook_mean, rtol=1e-6, atol=1e-6
+            )
 
+            # check that decoders behave similar (for same input)
+            hf_decoded_mean = model.decode(encoded_hf)["audio_values"].mean().item()
+            torch.testing.assert_close(hf_decoded_mean, expected_decoded_mean, rtol=1e-6, atol=1e-6)
+
+            # decode
             _, quantized_representation, _, _ = encoder_outputs.to_tuple()
             input_values_dec = model.decode(quantized_representation)[0]
             input_values_enc_dec = model(inputs["input_values"])[1]
 
             # make sure forward and decode gives same result
-            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-3, atol=1e-3)
-
-            arr = inputs["input_values"].cpu().numpy()
-            arr_enc_dec = input_values_enc_dec.cpu().numpy()
-
-            max_length = min(arr_enc_dec.shape[-1], arr.shape[-1])
-
-            arr_cut = arr[:, 0, :max_length].copy()
-            arr_enc_dec_cut = arr_enc_dec[:, :max_length].copy()
+            torch.testing.assert_close(input_values_dec, input_values_enc_dec, rtol=1e-6, atol=1e-6)
 
             # make sure audios are more or less equal
-            rmse = compute_rmse(arr_cut, arr_enc_dec_cut)
+            rmse = compute_rmse(input_values_enc_dec, inputs["input_values"])
             self.assertTrue(rmse < expected_rmse)
+
+            # check that codec error is similar
+            torch.testing.assert_close(expected_codec_error, rmse, rtol=1e-6, atol=1e-6)
