@@ -4102,6 +4102,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         input_ids: Optional[torch.Tensor] = None,
         speaker: str = "Chelsie",
         use_audio_in_video: bool = False,
+        use_stream: bool = False,
         return_audio: Optional[bool] = None,
         thinker_max_new_tokens: int = 1024,
         talker_max_new_tokens: int = 4096,
