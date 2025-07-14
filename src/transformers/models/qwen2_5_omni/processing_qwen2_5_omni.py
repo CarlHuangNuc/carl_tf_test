@@ -109,6 +109,10 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         self.vision_eos_token = self.tokenizer.vision_eos_token
         self.audio_bos_token = self.tokenizer.audio_bos_token
         self.audio_eos_token = self.tokenizer.audio_eos_token
+        self.stream = False
+        self.first_slice = False
+        self.end_slice = False
+        self.end_tokens_string = ""
 
     def __call__(
         self,
@@ -150,6 +154,13 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
+
+        if "stream" in kwargs:
+            self.stream = True
+        if "first_slice" in kwargs:
+            self.first_slice = kwargs["first_slice"]
+        if "end_slice" in kwargs:
+            self.end_slice = kwargs["end_slice"]
 
         seconds_per_chunk = output_kwargs["videos_kwargs"].pop("seconds_per_chunk")
         position_id_per_seconds = output_kwargs["videos_kwargs"].pop("position_id_per_seconds")
@@ -206,12 +217,67 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             seconds_per_chunk=seconds_per_chunk,
         )
 
+        print(text[0])
+
+        #text[0] = "<|im_start|>system\nYou are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.<|im_end|>\n<|im_start|>user\n<|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|im_end|>\n<|im_start|>assistant\n"
+        
+
+#        text[0] = "<|im_start|>system\nYou are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.<|im_end|>\n<|im_start|>user\n<|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|im_end|>\n<|im_start|>assistant\n"
+
+        #exit()
+        #### carl add 
+        if self.stream:
+            before, mid, after=self.split_audio_tags(text[0])
+            self.end_tokens_string=after
+            text = []
+            if self.first_slice and not self.end_slice:    
+                #text.append(before+mid)
+                #text.append(before+mid+"<|audio_eos|>")
+                text.append(before+mid+"<|audio_eos|><|im_end|>\n")
+
+            elif self.end_slice and not self.first_slice:
+                text.append("<|im_start|>user<|audio_bos|>"+mid+"<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
+                #text.append("<|audio_bos|>"+ mid+ "<|audio_eos|>")
+                #text.append(mid+"<|audio_eos|><|im_end|>\n")
+                print(text)
+            elif self.first_slice and self.end_slice:
+                 #text.append("<|im_end|>\n<|im_start|>assistant\n")
+                 #text.append("<|im_start|>assistant\n")
+                 text.append("<|im_start|>user<|audio_bos|>"+mid+"<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
+                 print(text)
+            else:  
+                text.append("<|im_start|>user<|audio_bos|>" +mid+ "<|audio_eos|><|im_end|>\n")
+                #text.append(before+mid+"<|audio_eos|><|im_end|>\n")
+                #text.append(mid)
+                #text.append("<|im_start|>user<|audio_bos|>" +mid+ "<|audio_eos|>")
+                
+
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
 
         return BatchFeature(
             data={**texts_inputs, **images_inputs, **videos_inputs, **audio_inputs},
             tensor_type=kwargs.get("return_tensors"),
         )
+
+
+    def split_audio_tags(self,text):
+        """查找字符串中第一个和最后一个<|AUDIO|>的位置，并分割字符串为三部分"""
+        # 查找第一个<|AUDIO|>的位置
+        first_pos = text.find('<|AUDIO|>')                    
+        if first_pos == -1:
+            # 如果没找到任何<|AUDIO|>标签
+            return text, '', ''                                            
+        # 查找最后一个<|AUDIO|>的位置
+        last_pos = text.rfind('<|AUDIO|>')
+        # 计算最后一个标签的结束位置
+        last_end = last_pos + len('<|AUDIO|>')
+        #first_pos = first_pos - len('<|AUDIO|>')
+        # 分割字符串
+        part1 = text[:first_pos]
+        part2 = text[first_pos:last_end]
+        part3 = text[last_end:]
+        return part1, part2, part3
+
 
     def replace_multimodal_special_tokens(
         self,
@@ -224,6 +290,7 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         position_id_per_seconds,
         seconds_per_chunk,
     ):
+
         # Extend mm token length
         merge_length_image = self.image_processor.merge_size**2
         merge_length_video = self.video_processor.merge_size**2
