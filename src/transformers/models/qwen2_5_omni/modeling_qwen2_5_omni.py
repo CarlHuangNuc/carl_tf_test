@@ -1720,6 +1720,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.spatial_merge_size = config.vision_config.spatial_merge_size
         self.rope_deltas = None
         self.llm_past_key_values = None
+        self.use_stream = False
         self.is_first_gene = True
         self.post_init()
 
@@ -1734,121 +1735,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
     def get_decoder(self):
         return self.model
-
-    def streaming_decode(self,
-        input_ids: Optional[torch.LongTensor] = None,
-        input_features: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        feature_attention_mask: Optional[torch.Tensor] = None,
-        audio_feature_lengths: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        rope_deltas: Optional[torch.LongTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        use_audio_in_video: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        video_second_per_grid: Optional[torch.LongTensor] = None,
-         **kwargs,
-            ):
-
-        print("decode...............")
-
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-                )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if inputs_embeds is None:
-            # 1. Extract the input embeddings
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        print(inputs_embeds.shape)
-
-        if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
-            if input_features is not None:
-                audio_features = self.get_audio_features(
-                        input_features,
-                        feature_attention_mask=feature_attention_mask,
-                        audio_feature_lengths=audio_feature_lengths,
-                        )
-                audio_mask = (
-                        (input_ids == self.config.audio_token_id)
-                        .unsqueeze(-1)
-                        .expand_as(inputs_embeds)
-                        .to(inputs_embeds.device)
-                        )
-                audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
-
-
-        if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-        else:
-            audio_feature_lengths = None
-
-
-        if self.llm_past_key_values is not None:
-            cache_length = self.llm_past_key_values[0][0].shape[2]
-        else:
-            cache_length = 0    
-        attention_mask = torch.ones((1, cache_length + inputs_embeds.shape[1]), dtype=torch.int, device=self.device)
-
-
-        ###carl change ..
-        position_ids = None
-        use_cache = True
-        print("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv")
-        print(self.llm_past_key_values[0][0].shape[2])
-        print(attention_mask.shape)
-        print(cache_position)
-        print(inputs_embeds.shape)
-
-        outputs = self.model(attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=self.llm_past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-                )
-
-        print("kkkkkkkkkkkkkkkkkkkkkkkkkkk")
-        print(outputs)
-        print(outputs.keys())
-
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-
-        print(logits)
-        print(logits.shape)
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
-                    )
-
-
-        return Qwen2_5OmniThinkerCausalLMOutputWithPast(loss=loss,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-                rope_deltas=self.rope_deltas,)
-
 
     def streaming_prefill(self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1875,10 +1761,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         **kwargs,
         ):
 
-        print("111111111111111111111111111")
-        print(input_ids.shape)
-        print(input_features.shape)
-        print(attention_mask)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
                 output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1889,7 +1771,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        print(inputs_embeds.shape)
         # 2. Merge text , audios , image and video
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
             if input_features is not None:
@@ -1902,25 +1783,31 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
-        #### carl  del image .video need add ...
+            if pixel_values is not None:
+                image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+                image_mask = ((input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device))
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+
+            if pixel_values_videos is not None:
+                video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+                video_mask = ((input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device))
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
 
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         else:
             audio_feature_lengths = None
 
-        print("dddddddddd")
-        print(audio_feature_lengths)
-        print(attention_mask)
         if self.llm_past_key_values is not None:
             cache_length = self.llm_past_key_values[0][0].shape[2]
         else:
             cache_length = 0
         attention_mask = torch.ones((1, cache_length + inputs_embeds.shape[1]), dtype=torch.int, device=self.device)
                   
-        print("ffffffffffffffffffffffff........................................")
-        print(cache_length)
-
         if attention_mask is not None and position_ids is None:
             if (cache_position is None
                     or (cache_position is not None and cache_position[0] == 0)
@@ -1947,24 +1834,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
 
-        print("1111111111111111111111111111111111111")
-        print(attention_mask.shape)
-        print(position_ids.shape)
-        
-        if self.llm_past_key_values is not None:
-            print((self.llm_past_key_values[0][0].shape))
-        else:
-            print("the first ....slices...")
-
-        use_cache = True
-        position_ids = None
-        ### carl set for ...
-        print(position_ids)
-        print(attention_mask.shape)
-        print(cache_position)
-        print(output_attentions)
-        print(output_hidden_states)
-
         outputs = self.model(attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=self.llm_past_key_values,
@@ -1976,13 +1845,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 cache_position=cache_position,
                 )
 
-        print("222222222222222222222222222222222222222")
-        print(attention_mask.shape)
-        print(outputs.keys())
-        print(outputs["last_hidden_state"].shape)
         self.llm_past_key_values = outputs["past_key_values"]
-        print(self.llm_past_key_values[0][0].shape)
-
+        self.use_stream = True
 
         return None
 
@@ -2200,33 +2064,23 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         else:
             audio_feature_lengths = None
 
-        print("rrrrrrrrrrrrrrrrrrrrrrrrrr") 
-        if self.llm_past_key_values is not None:
-            cache_length = self.llm_past_key_values[0][0].shape[2]
-        else:
-            cache_length = 0
-        print(inputs_embeds.shape)
-        print(attention_mask.shape)
-        print(cache_position)
-        print(cache_length)
-        print(cache_position.shape)
-        #tensor_gpu_direct = torch.arange(24, device='cuda:0')
-        #print(tensor_gpu_direct)
-        
-        
-        if self.is_first_gene == True:
-            attention_mask = torch.ones((1, cache_length + inputs_embeds.shape[1]), dtype=torch.int, device=self.device)
-            #cache_position = torch.arange((cache_length + inputs_embeds.shape[1]), device='cuda:0')  
-            self.is_first_gene == False
-        else:
-            #attention_mask = torch.ones((1, inputs_embeds.shape[1]), dtype=torch.int, device=self.device)
-            print("55555555555555555")
-            print(attention_mask.shape)
-            
+        if self.use_stream:
 
-    
+        ### carl add start
+            if self.llm_past_key_values is not None:
+                cache_length = self.llm_past_key_values[0][0].shape[2]
+            else:
+                cache_length = 0
         
-        '''
+            if self.is_first_gene == True:
+                attention_mask = torch.ones((1, cache_length + inputs_embeds.shape[1]), dtype=torch.int, device=self.device)
+                self.is_first_gene == False
+            else:
+                print(attention_mask.shape)
+       
+
+        ### carl add end
+        
         if attention_mask is not None and position_ids is None:
             if (
                 cache_position is None
@@ -2253,34 +2107,35 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        print("888888888888888888888888888")
-        print(position_ids.shape)
-        '''  
-        print("--------------------1111111111111111111111111111111111111")
-        print(attention_mask.shape)
-        print(cache_position.shape)
-        print(cache_position)
-        
-        outputs = self.model(
-            attention_mask=attention_mask,
-            #position_ids=position_ids,
-            position_ids=None,
-            #past_key_values=past_key_values,
-            past_key_values=self.llm_past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
+        if self.use_stream:
 
-        print(outputs.keys())
-        print((outputs["last_hidden_state"].shape))
+            outputs = self.model(
+                attention_mask=attention_mask,
+                position_ids=None,
+                past_key_values=self.llm_past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
+        else:
+
+            outputs = self.model(attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_values=past_key_values,                                                                                    
+                                inputs_embeds=inputs_embeds,
+                                use_cache=use_cache,
+                                output_attentions=output_attentions,
+                                output_hidden_states=output_hidden_states,
+                                return_dict=return_dict,
+                                cache_position=cache_position,
+                                )
+
+
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        #exit()
-
         loss = None
         if labels is not None:
             loss = self.loss_function(
@@ -2291,9 +2146,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             output = (logits,) + outputs
             return (loss,) + output if loss is not None else output
 
-        print(logits.shape)
-        print(outputs.past_key_values[0][0].shape)
-        print("tttttttttttttttt")
+        #print(logits.shape)
+        #print(outputs.past_key_values[0][0].shape)
         return Qwen2_5OmniThinkerCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -4202,8 +4056,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             return None
         elif self.stream and self.end:
             thinker_result = self.thinker.generate(input_ids=input_ids, **thinker_kwargs)
-            #thinker_result = self.thinker.streaming_decode(input_ids=input_ids, **thinker_kwargs)
-            print(thinker_result.shape)
+            self.thinker.use_stream=False
         else:    
             thinker_result = self.thinker.generate(input_ids=input_ids, **thinker_kwargs)
 
