@@ -2109,6 +2109,27 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         if self.use_stream:
 
+            print("ppppppppppppppppppppppp")
+            print(attention_mask.shape)
+            print(self.llm_past_key_values[0][0].shape)
+            print(inputs_embeds.shape)
+            print(use_cache)
+            print(cache_position)
+
+
+            if cache_length > 0:
+                cache_position = torch.arange(cache_length, 
+                                    cache_length + inputs_embeds.shape[1],
+                                            device=self.device
+                                                ).unsqueeze(0)
+            else:
+                cache_position = torch.arange(
+                                    inputs_embeds.shape[1], 
+                                            device=self.device
+                                                ).unsqueeze(0)
+            print(cache_position)
+
+
             outputs = self.model(
                 attention_mask=attention_mask,
                 position_ids=None,
