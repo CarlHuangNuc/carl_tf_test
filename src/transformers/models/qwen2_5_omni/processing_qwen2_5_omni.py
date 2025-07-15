@@ -156,7 +156,7 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         )
 
         if "stream" in kwargs:
-            self.stream = True
+            self.stream = kwargs["stream"]
         if "first_slice" in kwargs:
             self.first_slice = kwargs["first_slice"]
         if "end_slice" in kwargs:
@@ -233,13 +233,15 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             if self.first_slice and not self.end_slice:    
                 #text.append(before+mid)
                 #text.append(before+mid+"<|audio_eos|>")
-                text.append(before+mid+"<|audio_eos|><|im_end|>\n")
+                text.append("<|im_start|>user\n<|audio_bos|>"+mid+"<|audio_eos|>")
+                print(text)
 
             elif self.end_slice and not self.first_slice:
-                text.append("<|im_start|>user<|audio_bos|>"+mid+"<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
-                #text.append("<|audio_bos|>"+ mid+ "<|audio_eos|>")
+                #text.append("<|im_start|>user<|audio_bos|>"+mid+"<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
+                text.append("<|audio_bos|>"+ mid+ "<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
                 #text.append(mid+"<|audio_eos|><|im_end|>\n")
                 print(text)
+                #exit()
             elif self.first_slice and self.end_slice:
                  #text.append("<|im_end|>\n<|im_start|>assistant\n")
                  #text.append("<|im_start|>assistant\n")
@@ -251,7 +253,7 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
                 #text.append(mid)
                 #text.append("<|im_start|>user<|audio_bos|>" +mid+ "<|audio_eos|>")
                 
-
+        print(text)
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
 
         return BatchFeature(
