@@ -450,7 +450,7 @@ class StreamManager:
                     print("rrrrrrrrrrrrrrrrrrrrrrrr")
                     exit()
                     return True
-            if (len(self.audio_prefill) == (2000/self.audio_chunk)) or (is_end and len(self.audio_prefill)>0):
+            if (len(self.audio_prefill) == (1000/self.audio_chunk)) or (is_end and len(self.audio_prefill)>0):
                 time_prefill = time.time()
                 input_audio_path = self.savedir + f"/input_audio_log/input_audio_{self.input_audio_id}.wav"
                 print(input_audio_path)
@@ -461,8 +461,8 @@ class StreamManager:
                     audio_np, sr = librosa.load(input_audio_path, sr=16000, mono=True)
                 self.audio_prefill = []
 
-                if len(audio_np) > 32000:
-                    audio_np = audio_np[:32000] 
+                if len(audio_np) > 16000:
+                    audio_np = audio_np[:16000] 
 
                 with torch.no_grad():
                     if self.image_prefill is not None:
@@ -503,27 +503,27 @@ class StreamManager:
                         if self.input_audio_id == 0:
                             #inputs = self.processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO)
                             inputs = self.processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO,stream=True,first_slice=True,end_slice=False)
-                        else:    
+                        elif self.input_audio_id == 6:    
                             inputs = self.processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO,stream=True,first_slice=False, end_slice=True)
+                        else:
+                            inputs = self.processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=USE_AUDIO_IN_VIDEO,stream=True,first_slice=False, end_slice=False)
                         print("cccccccccccccccccccccccccccccccccccccccccc")                        
                         print(inputs["input_ids"].shape)
                         print(inputs["attention_mask"].shape)
                         print(inputs["input_ids"])
+
                         inputs = inputs.to(self.minicpmo_model.device).to(self.minicpmo_model.dtype)
                         start_time = time.perf_counter() 
                         if self.input_audio_id == 0:
                             stream_text_ids = self.minicpmo_model.generate(**inputs,use_audio_in_video=USE_AUDIO_IN_VIDEO, return_audio=False, use_stream=True,is_end=False)
-                            #stream_text_ids = self.minicpmo_model.generate(**inputs,use_audio_in_video=USE_AUDIO_IN_VIDEO, return_audio=False)
-                            #text = self.processor.batch_decode(stream_text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                           # print('text: ', text)
-                           # exit()
+                        elif self.input_audio_id != 6:
 
-                        elif self.input_audio_id == 1:
+                            print("dddddddddddddaaaaaaaaaaaaaaaaa:self.input_audio_id=",self.input_audio_id)
+                            stream_text_ids = self.minicpmo_model.generate(**inputs,use_audio_in_video=USE_AUDIO_IN_VIDEO, return_audio=False, use_stream=True,is_end=False)
+                        else:    
                             
                             stream_text_ids = self.minicpmo_model.generate(**inputs,use_audio_in_video=USE_AUDIO_IN_VIDEO, return_audio=False, use_stream=True,is_end=True)
                             start_time=time.perf_counter()
-                            #stream_text_ids = self.minicpmo_model.generate(**inputs,use_audio_in_video=USE_AUDIO_IN_VIDEO, return_audio=False)
-                            #stream_text_ids, audio = self.minicpmo_model.generate(**inputs,use_audio_in_video=USE_AUDIO_IN_VIDEO, use_stream=True,is_end=True)
                             text = self.processor.batch_decode(stream_text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
                             print('text: ', text)
                             exit()
@@ -545,8 +545,6 @@ class StreamManager:
                             end_time = time.perf_counter()
                             execution_time = end_time - start_time
                             print(f"第一个chunk 从送video 到输出第一个audio执行时间: {execution_time:.6f} 秒")
-                        else:
-                            print("3333333333333333333")
 
                         print("tttttttttttttttt,input............aduio...id===",self.input_audio_id)
                         #if self.input_audio_id == 0:
@@ -702,7 +700,8 @@ class StreamManager:
             self.sys_prompt_flag = True
             self.sys_prompt_init(1)
         
-        audio_path = "/mnt/huangke1/LIM/test_code/qwen/test_cpm_qwen/log_data/32550/1751525672.7709742/input_audio/all_input_audio_0.wav"
+        #audio_path = "/mnt/huangke1/LIM/test_code/qwen/test_cpm_qwen/log_data/32550/1751525672.7709742/input_audio/all_input_audio_0.wav"
+        audio_path = "./test_audio/translate_to_chinese.wav"
         audio_np, sr = librosa.load(audio_path, sr=16000, mono=True)
         tap = int(16000*0.2)
         time_len = math.ceil(len(audio_np) / tap)
