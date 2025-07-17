@@ -1680,7 +1680,6 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -1720,6 +1719,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.spatial_merge_size = config.vision_config.spatial_merge_size
         self.rope_deltas = None
         self.llm_past_key_values = None
+        self.hide_all_state = None
         self.use_stream = False
         self.is_first_gene = True
         self.post_init()
@@ -1796,18 +1796,22 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         else:
             audio_feature_lengths = None
-
         if self.llm_past_key_values is not None:
             cache_length = self.llm_past_key_values[0][0].shape[2]
         else:
             cache_length = 0
         attention_mask = torch.ones((1, cache_length + inputs_embeds.shape[1]), dtype=torch.int, device=self.device)
-                  
+       
+
+        cache_position = torch.arange(cache_length,
+                                    cache_length + inputs_embeds.shape[1],
+                                                        device=self.device)
+
+      
         if attention_mask is not None and position_ids is None:
             if (cache_position is None
                     or (cache_position is not None and cache_position[0] == 0)
@@ -1834,8 +1838,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
 
+        
+        use_cache =True
         outputs = self.model(attention_mask=attention_mask,
                 position_ids=position_ids,
+                #position_ids= None,
                 past_key_values=self.llm_past_key_values,
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
@@ -1846,7 +1853,13 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 )
 
         self.llm_past_key_values = outputs["past_key_values"]
+        if self.hide_all_state is None:
+            self.hide_all_state = outputs["last_hidden_state"]
+        else:
+            self.hide_all_state =  torch.cat([self.hide_all_state, outputs["last_hidden_state"]], dim=1)
         self.use_stream = True
+
+
 
         return None
 
@@ -2078,15 +2091,23 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             else:
                 print(attention_mask.shape)
        
+        else:
+            cache_length = 0
+
+        
+        cache_position = torch.arange(cache_length,
+                                            cache_length + inputs_embeds.shape[1],
+                                                                device=self.device)
+        
 
         ### carl add end
-        
         if attention_mask is not None and position_ids is None:
             if (
                 cache_position is None
                 or (cache_position is not None and cache_position[0] == 0)
                 or self.rope_deltas is None
             ):
+        
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids,
@@ -2107,53 +2128,34 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        
         if self.use_stream:
 
-            print("ppppppppppppppppppppppp")
-            print(attention_mask.shape)
-            print(self.llm_past_key_values[0][0].shape)
-            print(inputs_embeds.shape)
-            print(use_cache)
-            print(cache_position)
-
-
-            if cache_length > 0:
-                cache_position = torch.arange(cache_length, 
-                                    cache_length + inputs_embeds.shape[1],
-                                            device=self.device
-                                                ).unsqueeze(0)
-            else:
-                cache_position = torch.arange(
-                                    inputs_embeds.shape[1], 
-                                            device=self.device
-                                                ).unsqueeze(0)
-            print(cache_position)
-
-
-            outputs = self.model(
-                attention_mask=attention_mask,
-                position_ids=None,
-                past_key_values=self.llm_past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-            )
-        else:
-
             outputs = self.model(attention_mask=attention_mask,
-                                position_ids=position_ids,
-                                past_key_values=past_key_values,                                                                                    
+                    position_ids=position_ids,
+                    #position_ids=None,
+                    past_key_values=self.llm_past_key_values,            
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    cache_position=cache_position,
+                    )
+
+        else:
+            outputs = self.model(attention_mask=attention_mask,
+                                #position_ids=position_ids,
+                                position_ids=None,
+                                past_key_values=past_key_values,            
                                 inputs_embeds=inputs_embeds,
                                 use_cache=use_cache,
                                 output_attentions=output_attentions,
                                 output_hidden_states=output_hidden_states,
                                 return_dict=return_dict,
-                                cache_position=cache_position,
+                                #cache_position=cache_position,
+                                cache_position=None,
                                 )
-
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
@@ -2167,8 +2169,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             output = (logits,) + outputs
             return (loss,) + output if loss is not None else output
 
-        #print(logits.shape)
-        #print(outputs.past_key_values[0][0].shape)
         return Qwen2_5OmniThinkerCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -4073,11 +4073,13 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             thinker_kwargs["return_dict_in_generate"] = True
 
         if self.stream and not self.end:
+            self.thinker.use_stream = True
             thinker_result = self.thinker.streaming_prefill(input_ids=input_ids,**thinker_kwargs)
             return None
         elif self.stream and self.end:
+            self.thinker.use_stream = True
             thinker_result = self.thinker.generate(input_ids=input_ids, **thinker_kwargs)
-            self.thinker.use_stream=False
+            self.thinker.use_stream =False
         else:    
             thinker_result = self.thinker.generate(input_ids=input_ids, **thinker_kwargs)
 
