@@ -112,7 +112,6 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         self.stream = False
         self.first_slice = False
         self.end_slice = False
-        self.end_tokens_string = ""
 
     def __call__(
         self,
@@ -217,45 +216,22 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             seconds_per_chunk=seconds_per_chunk,
         )
 
-        print(text[0])
-
-        #text[0] = "<|im_start|>system\nYou are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.<|im_end|>\n<|im_start|>user\n<|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|im_end|>\n<|im_start|>assistant\n"
-        
-
-#        text[0] = "<|im_start|>system\nYou are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.<|im_end|>\n<|im_start|>user\n<|audio_bos|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|AUDIO|><|audio_eos|><|im_end|>\n<|im_start|>assistant\n"
-
-        #exit()
         #### carl add 
         if self.stream:
             before, mid, after=self.split_audio_tags(text[0])
-            self.end_tokens_string=after
             text = []
             if self.first_slice and not self.end_slice:    
+                text.append(before+mid+"<|audio_eos|>")
                 #text.append(before+mid)
-                #text.append(before+mid+"<|audio_eos|>")
-                text.append("<|im_start|>user\n<|audio_bos|>"+mid+"<|audio_eos|>")
-                print(text)
-
             elif self.end_slice and not self.first_slice:
-                #text.append("<|im_start|>user<|audio_bos|>"+mid+"<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
                 text.append("<|audio_bos|>"+ mid+ "<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
-                #text.append(mid+"<|audio_eos|><|im_end|>\n")
-                print(text)
-                #exit()
-            elif self.first_slice and self.end_slice:
-                 #text.append("<|im_end|>\n<|im_start|>assistant\n")
-                 #text.append("<|im_start|>assistant\n")
-                 text.append("<|im_start|>user<|audio_bos|>"+mid+"<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
-                 print(text)
+                #text.append( mid+ "<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
             else:  
-                text.append("<|im_start|>user<|audio_bos|>" +mid+ "<|audio_eos|><|im_end|>\n")
-                #text.append(before+mid+"<|audio_eos|><|im_end|>\n")
+                text.append("<|audio_bos|>" +mid+ "<|audio_eos|>")
                 #text.append(mid)
-                #text.append("<|im_start|>user<|audio_bos|>" +mid+ "<|audio_eos|>")
                 
-        print(text)
+        #print(text)
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
-
         return BatchFeature(
             data={**texts_inputs, **images_inputs, **videos_inputs, **audio_inputs},
             tensor_type=kwargs.get("return_tensors"),
